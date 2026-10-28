@@ -1,0 +1,865 @@
+// Change in this file: pv_b1(), quant_e_pairs() and pv_int_pairs() compute
+// the product of attention weights and values in integers (weights quantized
+// to 13 bits, values as slot-pair interleaved int8 rows, AttnKV in attn.h);
+// attn_impl() uses them for the int8 cache, attn_kv_insert() writes that
+// layout.
+
+// Origin: fx2-cmix-transformer by Vladimir Ivanov, GPL-3.0, file cpp_infer/src/opt/attn.cpp.
+// Ported and modified for this entry in 2026; the changes are listed in
+// sections 3 and 4 of README.md.
+// Optimized vanilla attention kernels - see attn.h for the layout/numerics
+// contract. Hot structure per head:
+//   1. q int8 -> int16 pair table (8 vector ops).
+//   2. QK scan over the K blocks in slot/memory order: 32 positions per
+//      iteration, 4 int32 accumulators, vpbroadcastd(q pair) x
+//      vpmaddwd(k pair row) -> exact int32 dots vertically; scores =
+//      cvtepi32_ps * coef stored to a scratch buffer with a fused vector max.
+//      prefetcht0 ~2KB ahead (MACHINE.md section 2).
+//   3. exp pass over 8-score groups: d = s - max; kept mask = d >= -thr;
+//      whole groups with no kept lane are skipped BEFORE any exp math;
+//      exp256_ps on kept groups, masked into the denominator; kept group
+//      ids+masks recorded for PV.
+//   4. PV over kept rows only: int8 V row -> vpmovsxbd + vcvtdq2ps + fmadd
+//      into 8 fp32 accumulators; (sv/den) folded into one final multiply.
+#include "attn.h"
+
+#include <immintrin.h>
+
+#include <cmath>
+#include <cstring>
+
+#include "vec_math.h"
+
+namespace fx2 {
+namespace opt {
+
+// phase tick counters (rdtsc ticks), only accumulated in -DATTN_PROFILE
+// builds: [0]=qk, [1]=exp, [2]=pv, [3]=whole-step calls
+uint64_t g_attn_prof[4];
+
+namespace {
+
+#ifdef ATTN_PROFILE
+inline uint64_t prof_rd() {
+  unsigned lo, hi;
+  asm volatile("lfence\n\trdtsc" : "=a"(lo), "=d"(hi)::"memory");
+  return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+#define PROF_T(v) const uint64_t v = prof_rd()
+#define PROF_ADD(i, a, b) g_attn_prof[i] += (b) - (a)
+#else
+#define PROF_T(v) (void)0
+#define PROF_ADD(i, a, b) (void)0
+#endif
+
+#define AK1_QKPF 2048
+#define AK1_PVPF 1024
+#define AK1_PVPF16 4096
+#define AK1_PVPFB1 2048
+#define AK1_STR2(x) #x
+#define AK1_STR(x) AK1_STR2(x)
+
+// scratch (single-threaded; see attn.h)
+alignas(64) float g_sc[ATTN_WIN + 32];  // scores, padded with -inf
+alignas(64) float g_eb[ATTN_WIN + 32];  // exp values (+0.0 = excluded lane)
+
+inline float hsum8(__m256 v) {
+  __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+  lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+  lo = _mm_add_ss(lo, _mm_movehdup_ps(lo));
+  return _mm_cvtss_f32(lo);
+}
+
+inline float hmax8(__m256 v) {
+  __m128 lo = _mm_max_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+  lo = _mm_max_ps(lo, _mm_movehl_ps(lo, lo));
+  lo = _mm_max_ss(lo, _mm_movehdup_ps(lo));
+  return _mm_cvtss_f32(lo);
+}
+
+// ---------------------------------------------------------------------------
+// K row loading: one pair-row half (8 positions x int16 pair) per ymm.
+// int8 layout: vpmovsxbw with a memory operand. (An in-lane
+// vpcmpgtb+vpunpck variant with a compensating permuted insert was tried and
+// MEASURED SLOWER: the extra live temporaries caused register spills in the
+// 2x-unrolled scan and the insert path slowed 292 -> 480 cyc; reverted.)
+// ---------------------------------------------------------------------------
+struct KH {
+  __m256i lo, hi;  // 2 x (8 positions x int16 pair)
+};
+inline KH ldk2(const int8_t* row) {
+  return {_mm256_cvtepi8_epi16(
+              _mm_load_si128(reinterpret_cast<const __m128i*>(row))),
+          _mm256_cvtepi8_epi16(
+              _mm_load_si128(reinterpret_cast<const __m128i*>(row + 16)))};
+}
+inline KH ldk2(const int16_t* row) {
+  return {_mm256_load_si256(reinterpret_cast<const __m256i*>(row)),
+          _mm256_load_si256(reinterpret_cast<const __m256i*>(row + 16))};
+}
+
+// ---------------------------------------------------------------------------
+// QK scan: scores for slots [0, n) of head kh, fused running max over the
+// full 32-position blocks; tail (var kernel only) computed per 16-block, then
+// the buffer is padded to a 32 boundary with -inf and the tail is max-folded.
+// FIXED specializes every loop count to the 1024-slot shape.
+// ---------------------------------------------------------------------------
+template <bool FIXED, typename T>
+inline float qk_scan(const T* kh, const int32_t* qp32, float coef, int n,
+                     float* sc) {
+  const __m256 vcoef = _mm256_set1_ps(coef);
+  __m256 vmax = _mm256_set1_ps(-INFINITY);
+  const int nDB = FIXED ? (ATTN_WIN / 32) : (n >> 5);
+  const T* kb = kh;
+  float* scp = sc;
+  for (int bb = 0; bb < nDB; bb++, kb += 2048, scp += 32) {
+    __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;
+    for (int i = 0; i < 32; i += 2) {
+      // prefetch the next double block (~2KB ahead), covering all its lines
+      _mm_prefetch(reinterpret_cast<const char*>(kb + AK1_QKPF + i * 64),
+                   _MM_HINT_T0);
+      _mm_prefetch(
+          reinterpret_cast<const char*>(kb + AK1_QKPF + i * 64 + 32),
+          _MM_HINT_T0);
+      const __m256i qb = _mm256_set1_epi32(qp32[i]);
+      const KH h0 = ldk2(kb + i * 32);
+      const KH h1 = ldk2(kb + 1024 + i * 32);
+      a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(qb, h0.lo));
+      a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(qb, h0.hi));
+      a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(qb, h1.lo));
+      a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(qb, h1.hi));
+      const __m256i qc = _mm256_set1_epi32(qp32[i + 1]);
+      const KH h2 = ldk2(kb + (i + 1) * 32);
+      const KH h3 = ldk2(kb + 1024 + (i + 1) * 32);
+      a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(qc, h2.lo));
+      a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(qc, h2.hi));
+      a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(qc, h3.lo));
+      a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(qc, h3.hi));
+    }
+    const __m256 s0 = _mm256_mul_ps(_mm256_cvtepi32_ps(a0), vcoef);
+    const __m256 s1 = _mm256_mul_ps(_mm256_cvtepi32_ps(a1), vcoef);
+    const __m256 s2 = _mm256_mul_ps(_mm256_cvtepi32_ps(a2), vcoef);
+    const __m256 s3 = _mm256_mul_ps(_mm256_cvtepi32_ps(a3), vcoef);
+    _mm256_store_ps(scp + 0, s0);
+    _mm256_store_ps(scp + 8, s1);
+    _mm256_store_ps(scp + 16, s2);
+    _mm256_store_ps(scp + 24, s3);
+    vmax = _mm256_max_ps(vmax, _mm256_max_ps(_mm256_max_ps(s0, s1),
+                                             _mm256_max_ps(s2, s3)));
+  }
+  if (!FIXED) {
+    const int rem = n - (nDB << 5);
+    if (rem) {
+      const int nblk = (rem + 15) >> 4;  // 1 or 2 single 16-blocks
+      for (int b = 0; b < nblk; b++) {
+        const T* k1 = kb + static_cast<size_t>(b) * 1024;
+        __m256i a0 = _mm256_setzero_si256(), a1 = a0;
+        for (int i = 0; i < 32; i++) {
+          const __m256i qb = _mm256_set1_epi32(qp32[i]);
+          const KH h = ldk2(k1 + i * 32);
+          a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(qb, h.lo));
+          a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(qb, h.hi));
+        }
+        _mm256_store_ps(scp + b * 16,
+                        _mm256_mul_ps(_mm256_cvtepi32_ps(a0), vcoef));
+        _mm256_store_ps(scp + b * 16 + 8,
+                        _mm256_mul_ps(_mm256_cvtepi32_ps(a1), vcoef));
+      }
+      // pad [n, next 32 boundary) with -inf, then fold the tail into the max
+      const int pad_end = (n + 31) & ~31;
+      for (int j = n; j < pad_end; j++) sc[j] = -INFINITY;
+      for (int j = nDB << 5; j < pad_end; j += 8)
+        vmax = _mm256_max_ps(vmax, _mm256_load_ps(sc + j));
+    }
+  }
+  return hmax8(vmax);
+}
+
+// ---------------------------------------------------------------------------
+// exp pass: branchless dense sweep. e = exp256(d) & (d >= -thr) is stored for
+// EVERY group; masked-out lanes become +0.0f, and exp256 never returns 0 for
+// a finite input, so eb[j] == 0 <=> position j is excluded - that IS the kept
+// set, so no list needs building here (the sparse PV path reconstructs group
+// masks from eb). The kept predicate runs on exactly the naive kernel's
+// d = score - max values -> identical kept set. unroll 4: exp256's ~35-cycle
+// dependency chain needs ~4 groups in flight to reach the 2 fp-ops/cycle
+// throughput ceiling. noinline: keeps the exp256 constants from colliding
+// with other phases' registers (inlining caused spill storms).
+// ---------------------------------------------------------------------------
+template <bool FIXED>
+__attribute__((noinline)) float exp_pass(const float* sc, int n, float m,
+                                         float thr, float* eb, int& kept_out) {
+  const __m256 vm = _mm256_set1_ps(m);
+  const __m256 vthr = _mm256_set1_ps(-thr);
+  __m256 vden0 = _mm256_setzero_ps(), vden1 = _mm256_setzero_ps();
+  // AND of all kept-masks over the FULL groups; all-ones at the end
+  // <=> every full-group lane kept (the dominant case: at the SPEC threshold
+  // nothing is ever excluded on real data) -> kept = n with no per-group
+  // scalar popcount work in the hot loop.
+  __m256 vall = _mm256_castsi256_ps(_mm256_set1_epi32(-1));
+  const int G = FIXED ? (ATTN_WIN / 8) : ((n + 7) >> 3);
+  const int Gfull = FIXED ? (ATTN_WIN / 8) : (n >> 3);  // full 8-lane groups
+  int g = 0;
+  for (; g + 4 <= Gfull; g += 4) {
+    const __m256 d0 = _mm256_sub_ps(_mm256_load_ps(sc + 8 * g), vm);
+    const __m256 d1 = _mm256_sub_ps(_mm256_load_ps(sc + 8 * g + 8), vm);
+    const __m256 d2 = _mm256_sub_ps(_mm256_load_ps(sc + 8 * g + 16), vm);
+    const __m256 d3 = _mm256_sub_ps(_mm256_load_ps(sc + 8 * g + 24), vm);
+    const __m256 k0 = _mm256_cmp_ps(d0, vthr, _CMP_GE_OQ);
+    const __m256 k1 = _mm256_cmp_ps(d1, vthr, _CMP_GE_OQ);
+    const __m256 k2 = _mm256_cmp_ps(d2, vthr, _CMP_GE_OQ);
+    const __m256 k3 = _mm256_cmp_ps(d3, vthr, _CMP_GE_OQ);
+    const __m256 e0 = _mm256_and_ps(exp256_ps(d0), k0);
+    const __m256 e1 = _mm256_and_ps(exp256_ps(d1), k1);
+    const __m256 e2 = _mm256_and_ps(exp256_ps(d2), k2);
+    const __m256 e3 = _mm256_and_ps(exp256_ps(d3), k3);
+    _mm256_store_ps(eb + 8 * g, e0);
+    _mm256_store_ps(eb + 8 * g + 8, e1);
+    _mm256_store_ps(eb + 8 * g + 16, e2);
+    _mm256_store_ps(eb + 8 * g + 24, e3);
+    vden0 = _mm256_add_ps(vden0, _mm256_add_ps(e0, e1));
+    vden1 = _mm256_add_ps(vden1, _mm256_add_ps(e2, e3));
+    vall = _mm256_and_ps(vall, _mm256_and_ps(_mm256_and_ps(k0, k1),
+                                             _mm256_and_ps(k2, k3)));
+  }
+  for (; g < G; g++) {
+    const __m256 d = _mm256_sub_ps(_mm256_load_ps(sc + 8 * g), vm);
+    const __m256 k = _mm256_cmp_ps(d, vthr, _CMP_GE_OQ);
+    const __m256 e = _mm256_and_ps(exp256_ps(d), k);
+    _mm256_store_ps(eb + 8 * g, e);
+    vden0 = _mm256_add_ps(vden0, e);
+    if (g < Gfull) vall = _mm256_and_ps(vall, k);
+  }
+  if (_mm256_movemask_ps(vall) == 0xFF) {
+    // all full groups fully kept; count the <=7 tail lanes only
+    int kept = Gfull * 8;
+    for (int j = Gfull * 8; j < n; j++) kept += (eb[j] != 0.0f);
+    kept_out = kept;
+  } else {  // genuinely pruning threshold: recount from eb (e==0 <=> excluded)
+    const __m256 vz = _mm256_setzero_ps();
+    __m256i vc = _mm256_setzero_si256();
+    for (int gg = 0; gg < G; gg++)  // lanes >= n hold e == 0 -> not counted
+      vc = _mm256_sub_epi32(
+          vc, _mm256_castps_si256(
+                  _mm256_cmp_ps(_mm256_load_ps(eb + 8 * gg), vz, _CMP_NEQ_OQ)));
+    __m128i lo = _mm_add_epi32(_mm256_castsi256_si128(vc),
+                               _mm256_extracti128_si256(vc, 1));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(1, 0, 3, 2)));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(2, 3, 0, 1)));
+    kept_out = _mm_cvtsi128_si32(lo);
+  }
+  return hsum8(_mm256_add_ps(vden0, vden1));
+}
+
+// ---------------------------------------------------------------------------
+// PV: accumulate e_j * v_row(j) into 8 fp32 accumulators, final multiply by
+// rfac = sv/den. Two paths:
+//  * dense (kept >= ~3/4 of n, i.e. always at the SPEC threshold 21 on real
+//    data): branchless sweep over ALL rows [0, n) - excluded rows have
+//    e == +0.0 and fmadd(0, v, acc) == acc bit-exactly, so no masking is
+//    needed; V streams sequentially (prefetched). The int8 loop is inline
+//    asm: clang rotates the accumulators through registers (fmadd213 forms)
+//    and spills one per iteration; pinning accs in ymm0-7 with fmadd231
+//    keeps the loop at its pipe floor. Bitwise-identical op order.
+//  * sparse (a genuinely pruning threshold): group masks reconstructed from
+//    eb (e != 0 <=> kept), V rows of skipped positions are never touched.
+// ---------------------------------------------------------------------------
+inline void pv_row(const int8_t* vrow, __m256 ve, __m256* acc) {
+  for (int t = 0; t < 8; t++) {
+    const __m256i vi = _mm256_cvtepi8_epi32(
+        _mm_loadl_epi64(reinterpret_cast<const __m128i*>(vrow + t * 8)));
+    acc[t] = _mm256_fmadd_ps(ve, _mm256_cvtepi32_ps(vi), acc[t]);
+  }
+}
+inline void pv_row(const float* vrow, __m256 ve, __m256* acc) {
+  for (int t = 0; t < 8; t++)
+    acc[t] = _mm256_fmadd_ps(ve, _mm256_load_ps(vrow + t * 8), acc[t]);
+}
+
+// dense int8 sweep, accumulators pinned in ymm0-7 (clang's version rotated
+// them through fmadd213 destinations and spilled one per iteration), 2 rows
+// per loop iteration with alternating temporaries. An in-lane
+// vpcmpgt/vpunpck variant was tried and measured slower (front-end bound at
+// 41 uops/row); the memory-operand vpmovsxbd triple is the sweet spot:
+// ~8 cvtdq2ps (1/cyc) + ~8 lane-crossing unpacks per row are the pipe floor.
+#define PV_ROW(OFF, E, T0, T1)                              \
+  "vpmovsxbd " #OFF "+0(%[v]), %%ymm" #T0 "\n\t"            \
+  "vcvtdq2ps %%ymm" #T0 ", %%ymm" #T0 "\n\t"                \
+  "vfmadd231ps %%ymm" #T0 ", %%ymm" #E ", %%ymm0\n\t"       \
+  "vpmovsxbd " #OFF "+8(%[v]), %%ymm" #T1 "\n\t"            \
+  "vcvtdq2ps %%ymm" #T1 ", %%ymm" #T1 "\n\t"                \
+  "vfmadd231ps %%ymm" #T1 ", %%ymm" #E ", %%ymm1\n\t"       \
+  "vpmovsxbd " #OFF "+16(%[v]), %%ymm" #T0 "\n\t"           \
+  "vcvtdq2ps %%ymm" #T0 ", %%ymm" #T0 "\n\t"                \
+  "vfmadd231ps %%ymm" #T0 ", %%ymm" #E ", %%ymm2\n\t"       \
+  "vpmovsxbd " #OFF "+24(%[v]), %%ymm" #T1 "\n\t"           \
+  "vcvtdq2ps %%ymm" #T1 ", %%ymm" #T1 "\n\t"                \
+  "vfmadd231ps %%ymm" #T1 ", %%ymm" #E ", %%ymm3\n\t"       \
+  "vpmovsxbd " #OFF "+32(%[v]), %%ymm" #T0 "\n\t"           \
+  "vcvtdq2ps %%ymm" #T0 ", %%ymm" #T0 "\n\t"                \
+  "vfmadd231ps %%ymm" #T0 ", %%ymm" #E ", %%ymm4\n\t"       \
+  "vpmovsxbd " #OFF "+40(%[v]), %%ymm" #T1 "\n\t"           \
+  "vcvtdq2ps %%ymm" #T1 ", %%ymm" #T1 "\n\t"                \
+  "vfmadd231ps %%ymm" #T1 ", %%ymm" #E ", %%ymm5\n\t"       \
+  "vpmovsxbd " #OFF "+48(%[v]), %%ymm" #T0 "\n\t"           \
+  "vcvtdq2ps %%ymm" #T0 ", %%ymm" #T0 "\n\t"                \
+  "vfmadd231ps %%ymm" #T0 ", %%ymm" #E ", %%ymm6\n\t"       \
+  "vpmovsxbd " #OFF "+56(%[v]), %%ymm" #T1 "\n\t"           \
+  "vcvtdq2ps %%ymm" #T1 ", %%ymm" #T1 "\n\t"                \
+  "vfmadd231ps %%ymm" #T1 ", %%ymm" #E ", %%ymm7\n\t"
+
+__attribute__((noinline)) void pv_dense_i8(const int8_t* v, const float* eb,
+                                           int n, float rfac, float* out64) {
+  int n2 = n >> 1;
+  const int odd = n & 1;
+  asm volatile(
+      "vxorps %%xmm0,%%xmm0,%%xmm0\n\t"
+      "vxorps %%xmm1,%%xmm1,%%xmm1\n\t"
+      "vxorps %%xmm2,%%xmm2,%%xmm2\n\t"
+      "vxorps %%xmm3,%%xmm3,%%xmm3\n\t"
+      "vxorps %%xmm4,%%xmm4,%%xmm4\n\t"
+      "vxorps %%xmm5,%%xmm5,%%xmm5\n\t"
+      "vxorps %%xmm6,%%xmm6,%%xmm6\n\t"
+      "vxorps %%xmm7,%%xmm7,%%xmm7\n\t"
+      "testl %[n2], %[n2]\n\t"
+      "jz 2f\n\t"
+      ".p2align 4\n\t"
+      "1:\n\t"
+      "vbroadcastss (%[eb]), %%ymm12\n\t"
+      "vbroadcastss 4(%[eb]), %%ymm13\n\t"
+      "prefetcht0 " AK1_STR(AK1_PVPF) "(%[v])\n\t"
+      "prefetcht0 " AK1_STR(AK1_PVPF) "+64(%[v])\n\t"
+      PV_ROW(0, 12, 8, 9)
+      PV_ROW(64, 13, 10, 11)
+      "addq $128, %[v]\n\t"
+      "addq $8, %[eb]\n\t"
+      "decl %[n2]\n\t"
+      "jnz 1b\n\t"
+      "2:\n\t"
+      "testl %[odd], %[odd]\n\t"
+      "jz 3f\n\t"
+      "vbroadcastss (%[eb]), %%ymm12\n\t"
+      PV_ROW(0, 12, 8, 9)
+      "3:\n\t"
+      "vbroadcastss %[rf], %%ymm13\n\t"
+      "vmulps %%ymm13, %%ymm0, %%ymm0\n\t"
+      "vmulps %%ymm13, %%ymm1, %%ymm1\n\t"
+      "vmulps %%ymm13, %%ymm2, %%ymm2\n\t"
+      "vmulps %%ymm13, %%ymm3, %%ymm3\n\t"
+      "vmulps %%ymm13, %%ymm4, %%ymm4\n\t"
+      "vmulps %%ymm13, %%ymm5, %%ymm5\n\t"
+      "vmulps %%ymm13, %%ymm6, %%ymm6\n\t"
+      "vmulps %%ymm13, %%ymm7, %%ymm7\n\t"
+      "vmovaps %%ymm0, (%[out])\n\t"
+      "vmovaps %%ymm1, 32(%[out])\n\t"
+      "vmovaps %%ymm2, 64(%[out])\n\t"
+      "vmovaps %%ymm3, 96(%[out])\n\t"
+      "vmovaps %%ymm4, 128(%[out])\n\t"
+      "vmovaps %%ymm5, 160(%[out])\n\t"
+      "vmovaps %%ymm6, 192(%[out])\n\t"
+      "vmovaps %%ymm7, 224(%[out])\n\t"
+      : [v] "+r"(v), [eb] "+r"(eb), [n2] "+r"(n2)
+      : [rf] "x"(rfac), [out] "r"(out64), [odd] "r"(odd)
+      : "ymm0", "ymm1", "ymm2", "ymm3", "ymm4", "ymm5", "ymm6", "ymm7",
+        "ymm8", "ymm9", "ymm10", "ymm11", "ymm12", "ymm13", "cc", "memory");
+}
+
+// dense fp32-mirror sweep (measurement variant)
+__attribute__((noinline)) void pv_dense_f32(const float* v, const float* eb,
+                                            int n, float rfac, float* out64) {
+  __m256 a0 = _mm256_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, a4 = a0,
+         a5 = a0, a6 = a0, a7 = a0;
+  for (int j = 0; j < n; j++) {
+    const float* r = v + size_t(j) * ATTN_DH;
+    _mm_prefetch(reinterpret_cast<const char*>(r + 16 * ATTN_DH), _MM_HINT_T0);
+    const __m256 ve = _mm256_broadcast_ss(eb + j);
+    a0 = _mm256_fmadd_ps(ve, _mm256_load_ps(r + 0), a0);
+    a1 = _mm256_fmadd_ps(ve, _mm256_load_ps(r + 8), a1);
+    a2 = _mm256_fmadd_ps(ve, _mm256_load_ps(r + 16), a2);
+    a3 = _mm256_fmadd_ps(ve, _mm256_load_ps(r + 24), a3);
+    a4 = _mm256_fmadd_ps(ve, _mm256_load_ps(r + 32), a4);
+    a5 = _mm256_fmadd_ps(ve, _mm256_load_ps(r + 40), a5);
+    a6 = _mm256_fmadd_ps(ve, _mm256_load_ps(r + 48), a6);
+    a7 = _mm256_fmadd_ps(ve, _mm256_load_ps(r + 56), a7);
+  }
+  const __m256 vf = _mm256_set1_ps(rfac);
+  _mm256_store_ps(out64 + 0, _mm256_mul_ps(a0, vf));
+  _mm256_store_ps(out64 + 8, _mm256_mul_ps(a1, vf));
+  _mm256_store_ps(out64 + 16, _mm256_mul_ps(a2, vf));
+  _mm256_store_ps(out64 + 24, _mm256_mul_ps(a3, vf));
+  _mm256_store_ps(out64 + 32, _mm256_mul_ps(a4, vf));
+  _mm256_store_ps(out64 + 40, _mm256_mul_ps(a5, vf));
+  _mm256_store_ps(out64 + 48, _mm256_mul_ps(a6, vf));
+  _mm256_store_ps(out64 + 56, _mm256_mul_ps(a7, vf));
+}
+
+inline void pv_dense(const int8_t* v, const float* eb, int n, float rfac,
+                     float* out64) {
+  pv_dense_i8(v, eb, n, rfac, out64);
+}
+inline void pv_dense(const float* v, const float* eb, int n, float rfac,
+                     float* out64) {
+  pv_dense_f32(v, eb, n, rfac, out64);
+}
+
+constexpr int EQ_BITS = 0 ? 0 : 13;
+constexpr int EQ_MAX = (1 << EQ_BITS) - 1;
+// pairs that fit before the int32 accumulator can overflow
+constexpr int EQ_CHUNK =
+    static_cast<int>((1LL << 31) / (2LL * EQ_MAX * 128));
+static_assert(EQ_CHUNK >= 8, "B1: EQ bits too large");
+alignas(64) int32_t g_ep[ATTN_WIN / 2 + 16];  // e_q pairs: e[2p] | e[2p+1]<<16
+
+// quantize the G = ceil(n/8) groups exp_pass wrote; returns sum of e_q
+inline int32_t quant_e_pairs(const float* eb, int n, int32_t* ep) {
+  const __m256 vmax = _mm256_set1_ps(static_cast<float>(EQ_MAX));
+  const int G = (n + 7) >> 3;
+  __m256i vs = _mm256_setzero_si256();
+  for (int g = 0; g < G; g++) {
+    const __m256i x =
+        _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_load_ps(eb + 8 * g), vmax));
+    vs = _mm256_add_epi32(vs, x);
+    const __m256i ev = _mm256_shuffle_epi32(x, _MM_SHUFFLE(2, 0, 2, 0));
+    const __m256i od = _mm256_shuffle_epi32(x, _MM_SHUFFLE(3, 1, 3, 1));
+    const __m256i pr = _mm256_or_si256(ev, _mm256_slli_epi32(od, 16));
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(ep + 4 * g),
+                     _mm256_castsi256_si128(pr));
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(ep + 4 * g + 2),
+                     _mm256_extracti128_si256(pr, 1));
+  }
+  __m128i lo = _mm_add_epi32(_mm256_castsi256_si128(vs),
+                             _mm256_extracti128_si256(vs, 1));
+  lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(1, 0, 3, 2)));
+  lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(2, 3, 0, 1)));
+  return _mm_cvtsi128_si32(lo);
+}
+
+// np slot pairs; v = 128-byte pair rows [v(2p,c), v(2p+1,c)] for c = 0..63
+#define PVI_ROW(A, OFF)                                                     \
+  A = _mm256_add_epi32(                                                    \
+      A, _mm256_madd_epi16(                                                \
+             qb, _mm256_cvtepi8_epi16(_mm_load_si128(                      \
+                     reinterpret_cast<const __m128i*>(v + (OFF))))));
+__attribute__((noinline)) void pv_int_pairs(const int8_t* v, const int32_t* ep,
+                                            int np, float rq, float* out64) {
+  __m256 f[8];
+  const bool chunked = EQ_CHUNK < (ATTN_WIN + 1) / 2;
+  if (chunked)
+    for (int t = 0; t < 8; t++) f[t] = _mm256_setzero_ps();
+  const __m256 vf = _mm256_set1_ps(rq);
+  for (int base = 0; base < np; base += EQ_CHUNK) {
+    const int end = (np - base < EQ_CHUNK) ? np : base + EQ_CHUNK;
+    __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0, a4 = a0,
+            a5 = a0, a6 = a0, a7 = a0;
+    for (int p = base; p < end; p++, v += 2 * ATTN_DH) {
+      _mm_prefetch(reinterpret_cast<const char*>(v + AK1_PVPFB1),
+                   _MM_HINT_T0);
+      _mm_prefetch(reinterpret_cast<const char*>(v + AK1_PVPFB1 + 64),
+                   _MM_HINT_T0);
+      const __m256i qb = _mm256_set1_epi32(ep[p]);
+      PVI_ROW(a0, 0) PVI_ROW(a1, 16) PVI_ROW(a2, 32) PVI_ROW(a3, 48)
+      PVI_ROW(a4, 64) PVI_ROW(a5, 80) PVI_ROW(a6, 96) PVI_ROW(a7, 112)
+    }
+    const __m256i acc[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
+    if (!chunked) {
+      for (int t = 0; t < 8; t++)
+        _mm256_store_ps(out64 + 8 * t,
+                        _mm256_mul_ps(_mm256_cvtepi32_ps(acc[t]), vf));
+      return;
+    }
+    for (int t = 0; t < 8; t++)
+      f[t] = _mm256_add_ps(f[t], _mm256_cvtepi32_ps(acc[t]));
+  }
+  for (int t = 0; t < 8; t++)
+    _mm256_store_ps(out64 + 8 * t, _mm256_mul_ps(f[t], vf));
+}
+#undef PVI_ROW
+
+inline bool pv_b1(const int8_t* v, size_t row_bytes, const float* eb, int n,
+                  float sv, float* out64) {
+  if (row_bytes != 2 * ATTN_DH) return false;
+  const int32_t sq = quant_e_pairs(eb, n, g_ep);
+  pv_int_pairs(v, g_ep, (n + 1) >> 1, sv / static_cast<float>(sq), out64);
+  return true;
+}
+template <typename T>
+inline bool pv_b1(const T*, size_t, const float*, int, float, float*) {
+  return false;
+}
+
+template <typename VT>
+__attribute__((noinline)) void pv_sparse(const VT* vh, const float* eb, int n,
+                                         float rfac, float* out64) {
+  __m256 acc[8];
+  for (int t = 0; t < 8; t++) acc[t] = _mm256_setzero_ps();
+  const __m256 vzero = _mm256_setzero_ps();
+  const int G = (n + 7) >> 3;
+  for (int g = 0; g < G; g++) {
+    const __m256 e = _mm256_load_ps(eb + 8 * g);
+    unsigned bits = unsigned(
+        _mm256_movemask_ps(_mm256_cmp_ps(e, vzero, _CMP_NEQ_OQ)));
+    if (!bits) continue;
+    const VT* base = vh + static_cast<size_t>(g) * 8 * ATTN_DH;
+    const float* ebg = eb + 8 * g;
+    while (bits) {
+      const int l = __builtin_ctz(bits);
+      bits &= bits - 1;
+      _mm_prefetch(reinterpret_cast<const char*>(
+                       base + (l + 8) * ATTN_DH),  // likely-next row
+                   _MM_HINT_T0);
+      pv_row(base + l * ATTN_DH, _mm256_broadcast_ss(ebg + l), acc);
+    }
+  }
+  const __m256 vf = _mm256_set1_ps(rfac);
+  for (int t = 0; t < 8; t++)
+    _mm256_store_ps(out64 + t * 8, _mm256_mul_ps(acc[t], vf));
+}
+
+template <typename VT>
+inline void pv_pass(const VT* vh, const float* eb, int n, int kept, float rfac,
+                    float* out64) {
+  if (kept * 4 >= n * 3)
+    pv_dense(vh, eb, n, rfac, out64);
+  else
+    pv_sparse(vh, eb, n, rfac, out64);
+}
+
+#if defined(TF_ATTN_SHKV) && TF_KVH == 1
+// ---------------------------------------------------------------------------
+// shared K/V head (GQA with TF_KVH = 1, int8 AttnKV only; v10).
+// With one K/V head every query head h reads K/V head 0 with the same scales
+// (sk[h] = sk[0], sv[h] = sv[0], arena_build.cpp), and kv_expand() feeds the
+// three heads bit-identical k/v rows through identical norm/rope/quant ops, so
+// the three per-head copies of the ring are bit-identical. Only head 0 is
+// written and read here: one K scan and one V sweep serve all three query
+// heads, each K/V row is loaded and widened once instead of three times.
+// Output-identical to attn_impl: the QK and PV dot products are exact int32
+// sums (any order), and every float op (score scale, running max, exp_pass,
+// quant_e_pairs, chunked int->fp32 PV fold, final scale) is the same call or
+// the same expression on the same values as the per-head path.
+// ---------------------------------------------------------------------------
+alignas(64) float g_sc3[ATTN_NH][ATTN_WIN + 32];
+alignas(64) float g_eb3[ATTN_NH][ATTN_WIN + 32];
+alignas(64) int32_t g_ep3[ATTN_NH][ATTN_WIN / 2 + 16];
+
+// one head's tail of qk_scan (var kernel), unchanged
+inline void qk_tail1(const int8_t* kb, const int32_t* qp32, __m256 vcoef,
+                     int n, int nDB, float* sc, __m256& vmax) {
+  float* scp = sc + (nDB << 5);
+  const int rem = n - (nDB << 5);
+  if (!rem) return;
+  const int nblk = (rem + 15) >> 4;
+  for (int b = 0; b < nblk; b++) {
+    const int8_t* k1 = kb + static_cast<size_t>(b) * 1024;
+    __m256i a0 = _mm256_setzero_si256(), a1 = a0;
+    for (int i = 0; i < 32; i++) {
+      const __m256i qb = _mm256_set1_epi32(qp32[i]);
+      const KH h = ldk2(k1 + i * 32);
+      a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(qb, h.lo));
+      a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(qb, h.hi));
+    }
+    _mm256_store_ps(scp + b * 16, _mm256_mul_ps(_mm256_cvtepi32_ps(a0), vcoef));
+    _mm256_store_ps(scp + b * 16 + 8,
+                    _mm256_mul_ps(_mm256_cvtepi32_ps(a1), vcoef));
+  }
+  const int pad_end = (n + 31) & ~31;
+  for (int j = n; j < pad_end; j++) sc[j] = -INFINITY;
+  for (int j = nDB << 5; j < pad_end; j += 8)
+    vmax = _mm256_max_ps(vmax, _mm256_load_ps(sc + j));
+}
+
+// QK for the three query heads over the one K head: per 16-position block,
+// 3 x 2 int32 accumulators; scores and the per-head running max as qk_scan
+template <bool FIXED>
+inline void qk_scan3(const int8_t* kh, const int32_t (*qp32)[32],
+                     const float* coef3, int n, float* m3) {
+  const __m256 vc0 = _mm256_set1_ps(coef3[0]);
+  const __m256 vc1 = _mm256_set1_ps(coef3[1]);
+  const __m256 vc2 = _mm256_set1_ps(coef3[2]);
+  __m256 vm0 = _mm256_set1_ps(-INFINITY), vm1 = vm0, vm2 = vm0;
+  const int nDB = FIXED ? (ATTN_WIN / 32) : (n >> 5);
+  const int8_t* kb = kh;
+  for (int bb = 0; bb < nDB; bb++, kb += 2048) {
+    for (int half = 0; half < 2; half++) {
+      const int8_t* k1 = kb + half * 1024;
+      __m256i a00 = _mm256_setzero_si256(), a01 = a00, a10 = a00, a11 = a00,
+              a20 = a00, a21 = a00;
+      for (int i = 0; i < 32; i++) {
+        if (!(i & 1))
+          _mm_prefetch(reinterpret_cast<const char*>(k1 + AK1_QKPF + i * 32),
+                       _MM_HINT_T0);
+        const KH h = ldk2(k1 + i * 32);
+        const __m256i q0 = _mm256_set1_epi32(qp32[0][i]);
+        a00 = _mm256_add_epi32(a00, _mm256_madd_epi16(q0, h.lo));
+        a01 = _mm256_add_epi32(a01, _mm256_madd_epi16(q0, h.hi));
+        const __m256i q1 = _mm256_set1_epi32(qp32[1][i]);
+        a10 = _mm256_add_epi32(a10, _mm256_madd_epi16(q1, h.lo));
+        a11 = _mm256_add_epi32(a11, _mm256_madd_epi16(q1, h.hi));
+        const __m256i q2 = _mm256_set1_epi32(qp32[2][i]);
+        a20 = _mm256_add_epi32(a20, _mm256_madd_epi16(q2, h.lo));
+        a21 = _mm256_add_epi32(a21, _mm256_madd_epi16(q2, h.hi));
+      }
+      const int o = bb * 32 + half * 16;
+      _mm256_store_ps(g_sc3[0] + o, _mm256_mul_ps(_mm256_cvtepi32_ps(a00), vc0));
+      _mm256_store_ps(g_sc3[0] + o + 8, _mm256_mul_ps(_mm256_cvtepi32_ps(a01), vc0));
+      _mm256_store_ps(g_sc3[1] + o, _mm256_mul_ps(_mm256_cvtepi32_ps(a10), vc1));
+      _mm256_store_ps(g_sc3[1] + o + 8, _mm256_mul_ps(_mm256_cvtepi32_ps(a11), vc1));
+      _mm256_store_ps(g_sc3[2] + o, _mm256_mul_ps(_mm256_cvtepi32_ps(a20), vc2));
+      _mm256_store_ps(g_sc3[2] + o + 8, _mm256_mul_ps(_mm256_cvtepi32_ps(a21), vc2));
+    }
+    // running max in qk_scan's exact form: max(vmax, max(max(s0,s1), max(s2,s3)))
+    const int o = bb * 32;
+#define QK3_MAX(VM, H)                                                        \
+  VM = _mm256_max_ps(                                                         \
+      VM, _mm256_max_ps(_mm256_max_ps(_mm256_load_ps(g_sc3[H] + o),           \
+                                      _mm256_load_ps(g_sc3[H] + o + 8)),      \
+                        _mm256_max_ps(_mm256_load_ps(g_sc3[H] + o + 16),      \
+                                      _mm256_load_ps(g_sc3[H] + o + 24))));
+    QK3_MAX(vm0, 0) QK3_MAX(vm1, 1) QK3_MAX(vm2, 2)
+#undef QK3_MAX
+  }
+  if (!FIXED) {
+    qk_tail1(kh + static_cast<size_t>(nDB) * 2048, qp32[0], vc0, n, nDB, g_sc3[0], vm0);
+    qk_tail1(kh + static_cast<size_t>(nDB) * 2048, qp32[1], vc1, n, nDB, g_sc3[1], vm1);
+    qk_tail1(kh + static_cast<size_t>(nDB) * 2048, qp32[2], vc2, n, nDB, g_sc3[2], vm2);
+  }
+  m3[0] = hmax8(vm0);
+  m3[1] = hmax8(vm1);
+  m3[2] = hmax8(vm2);
+}
+
+// PV for the three query heads over the one V head: two sweeps, each over one
+// 64-byte line (32 dims) of every 128-byte pair row, 3 x 4 int32 accumulators;
+// chunking and the fp32 fold exactly as pv_int_pairs per head
+__attribute__((noinline)) void pv_int_pairs3(const int8_t* v, int np,
+                                             const float* rq3, float* out192) {
+  const bool chunked = EQ_CHUNK < (ATTN_WIN + 1) / 2;
+  for (int half = 0; half < 2; half++) {
+    __m256 f[3][4];
+    if (chunked)
+      for (int h = 0; h < 3; h++)
+        for (int t = 0; t < 4; t++) f[h][t] = _mm256_setzero_ps();
+    for (int base = 0; base < np; base += EQ_CHUNK) {
+      const int end = (np - base < EQ_CHUNK) ? np : base + EQ_CHUNK;
+      __m256i a00 = _mm256_setzero_si256(), a01 = a00, a02 = a00, a03 = a00;
+      __m256i a10 = a00, a11 = a00, a12 = a00, a13 = a00;
+      __m256i a20 = a00, a21 = a00, a22 = a00, a23 = a00;
+      const int8_t* vp = v + static_cast<size_t>(base) * 2 * ATTN_DH + half * 64;
+      for (int p = base; p < end; p++, vp += 2 * ATTN_DH) {
+        _mm_prefetch(reinterpret_cast<const char*>(vp + AK1_PVPFB1), _MM_HINT_T0);
+        const __m256i q0 = _mm256_set1_epi32(g_ep3[0][p]);
+        const __m256i q1 = _mm256_set1_epi32(g_ep3[1][p]);
+        const __m256i q2 = _mm256_set1_epi32(g_ep3[2][p]);
+#define PV3_T(T, A0, A1, A2)                                                  \
+  {                                                                           \
+    const __m256i x = _mm256_cvtepi8_epi16(                                   \
+        _mm_load_si128(reinterpret_cast<const __m128i*>(vp + 16 * (T))));     \
+    A0 = _mm256_add_epi32(A0, _mm256_madd_epi16(q0, x));                      \
+    A1 = _mm256_add_epi32(A1, _mm256_madd_epi16(q1, x));                      \
+    A2 = _mm256_add_epi32(A2, _mm256_madd_epi16(q2, x));                      \
+  }
+        PV3_T(0, a00, a10, a20) PV3_T(1, a01, a11, a21)
+        PV3_T(2, a02, a12, a22) PV3_T(3, a03, a13, a23)
+#undef PV3_T
+      }
+      const __m256i acc[3][4] = {{a00, a01, a02, a03}, {a10, a11, a12, a13},
+                                 {a20, a21, a22, a23}};
+      if (!chunked) {
+        for (int h = 0; h < 3; h++) {
+          const __m256 vf = _mm256_set1_ps(rq3[h]);
+          for (int t = 0; t < 4; t++)
+            _mm256_store_ps(out192 + h * ATTN_DH + half * 32 + 8 * t,
+                            _mm256_mul_ps(_mm256_cvtepi32_ps(acc[h][t]), vf));
+        }
+        continue;
+      }
+      for (int h = 0; h < 3; h++)
+        for (int t = 0; t < 4; t++)
+          f[h][t] = _mm256_add_ps(f[h][t], _mm256_cvtepi32_ps(acc[h][t]));
+    }
+    if (chunked)
+      for (int h = 0; h < 3; h++) {
+        const __m256 vf = _mm256_set1_ps(rq3[h]);
+        for (int t = 0; t < 4; t++)
+          _mm256_store_ps(out192 + h * ATTN_DH + half * 32 + 8 * t,
+                          _mm256_mul_ps(f[h][t], vf));
+      }
+  }
+}
+
+template <bool FIXED>
+inline void attn_impl_shkv(const AttnKV& kv, const int8_t* q192,
+                           const float* coef3, const float* sv3, int n,
+                           float* out192, float thr_in, int* kept3) {
+  const float thr = thr_in > 0.0f ? thr_in : 1e30f;
+  alignas(32) int32_t qp32[ATTN_NH][32];
+  for (int h = 0; h < ATTN_NH; h++) {
+    const int8_t* qh = q192 + h * ATTN_DH;
+    for (int c = 0; c < 4; c++)
+      _mm256_store_si256(
+          reinterpret_cast<__m256i*>(qp32[h] + c * 8),
+          _mm256_cvtepi8_epi16(_mm_loadu_si128(
+              reinterpret_cast<const __m128i*>(qh + c * 16))));
+  }
+  float m3[ATTN_NH];
+  qk_scan3<FIXED>(&kv.k[0][0][0][0], qp32, coef3, n, m3);
+  float rq3[ATTN_NH];
+  for (int h = 0; h < ATTN_NH; h++) {
+    int kept;
+    (void)exp_pass<FIXED>(g_sc3[h], n, m3[h], thr, g_eb3[h], kept);
+    if (kept3) kept3[h] = kept;
+    const int32_t sq = quant_e_pairs(g_eb3[h], n, g_ep3[h]);
+    rq3[h] = sv3[h] / static_cast<float>(sq);
+  }
+  pv_int_pairs3(&kv.v[0][0][0], (n + 1) >> 1, rq3, out192);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// full step
+// ---------------------------------------------------------------------------
+template <typename KV, bool FIXED>
+inline void attn_impl(const KV& kv, const int8_t* q192, const float* coef3,
+                      const float* sv3, int n, float* out192, float thr_in,
+                      int* kept3) {
+  // thr <= 0 -> exact: the compare keeps every valid lane (finite scores are
+  // always >= max - 1e30) and rejects the -inf padding lanes.
+  const float thr = thr_in > 0.0f ? thr_in : 1e30f;
+  for (int h = 0; h < ATTN_NH; h++) {
+    alignas(32) int32_t qp32[32];  // q int16 pairs, one per 32-bit broadcast
+    const int8_t* qh = q192 + h * ATTN_DH;
+    for (int c = 0; c < 4; c++)
+      _mm256_store_si256(
+          reinterpret_cast<__m256i*>(qp32 + c * 8),
+          _mm256_cvtepi8_epi16(_mm_loadu_si128(
+              reinterpret_cast<const __m128i*>(qh + c * 16))));
+
+    PROF_T(p0);
+    const float m = qk_scan<FIXED>(&kv.k[h][0][0][0], qp32, coef3[h], n, g_sc);
+    PROF_T(p1);
+    int kept;
+    const float den = exp_pass<FIXED>(g_sc, n, m, thr, g_eb, kept);
+    if (kept3) kept3[h] = kept;
+    PROF_T(p2);
+    if (!pv_b1(&kv.v[h][0][0], sizeof(kv.v[0][0]), g_eb, n, sv3[h],
+               out192 + h * ATTN_DH))
+    pv_pass(&kv.v[h][0][0], g_eb, n, kept, sv3[h] / den,
+            out192 + h * ATTN_DH);
+    PROF_T(p3);
+    PROF_ADD(0, p0, p1);
+    PROF_ADD(1, p1, p2);
+    PROF_ADD(2, p2, p3);
+    PROF_ADD(3, 0, 1);
+  }
+}
+
+// K scatter of one head row (64 int8) into the transposed pair rows
+inline void kt_insert_head(int8_t* dst_pair0, const int8_t* k64) {
+  for (int i = 0; i < 32; i++)
+    std::memcpy(dst_pair0 + 32 * i, k64 + 2 * i, 2);
+}
+inline void kt_insert_head(int16_t* dst_pair0, const int8_t* k64) {
+  alignas(32) int16_t tmp[64];
+  for (int c = 0; c < 4; c++)
+    _mm256_store_si256(
+        reinterpret_cast<__m256i*>(tmp + c * 16),
+        _mm256_cvtepi8_epi16(_mm_loadu_si128(
+            reinterpret_cast<const __m128i*>(k64 + c * 16))));
+  for (int i = 0; i < 32; i++)
+    std::memcpy(dst_pair0 + 32 * i, tmp + 2 * i, 4);
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// public entry points
+// ---------------------------------------------------------------------------
+void attn_kv_insert(AttnKV& kv, int slot, const int8_t* k192,
+                    const int8_t* v192) {
+  const int b = slot >> 4, l = slot & 15;
+#if defined(TF_ATTN_SHKV) && TF_KVH == 1
+  for (int h = 0; h < 1; h++) {  // shared K/V head: heads 1, 2 are never read
+#else
+  for (int h = 0; h < ATTN_NH; h++) {
+#endif
+    kt_insert_head(&kv.k[h][b][0][2 * l], k192 + h * ATTN_DH);
+    const int8_t* s = v192 + h * ATTN_DH;
+    int8_t* d = &kv.v[h][slot >> 1][0];
+    const int o = slot & 1;
+    for (int c = 0; c < ATTN_DH; c++) d[2 * c + o] = s[c];
+  }
+}
+
+void attn_kv_insert(AttnKV16& kv, int slot, const int8_t* k192,
+                    const int8_t* v192) {
+  const int b = slot >> 4, l = slot & 15;
+  for (int h = 0; h < ATTN_NH; h++) {
+    kt_insert_head(&kv.k[h][b][0][2 * l], k192 + h * ATTN_DH);
+    std::memcpy(&kv.v[h][slot][0], v192 + h * ATTN_DH, ATTN_DH);
+  }
+}
+
+void attn_kv_insert(AttnKVF32& kv, int slot, const int8_t* k192,
+                    const int8_t* v192) {
+  const int b = slot >> 4, l = slot & 15;
+  for (int h = 0; h < ATTN_NH; h++) {
+    kt_insert_head(&kv.k[h][b][0][2 * l], k192 + h * ATTN_DH);
+    const int8_t* s = v192 + h * ATTN_DH;
+    float* d = &kv.v[h][slot][0];
+    for (int c = 0; c < 8; c++) {
+      const __m256i vi = _mm256_cvtepi8_epi32(
+          _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + c * 8)));
+      _mm256_store_ps(d + c * 8, _mm256_cvtepi32_ps(vi));
+    }
+  }
+}
+
+void attn_step_var(const AttnKV& kv, const int8_t* q192, const float* coef3,
+                   const float* sv3, int n, float* out192, float skip_threshold,
+                   int* kept3) {
+#if defined(TF_ATTN_SHKV) && TF_KVH == 1
+  attn_impl_shkv<false>(kv, q192, coef3, sv3, n, out192, skip_threshold, kept3);
+#else
+  attn_impl<AttnKV, false>(kv, q192, coef3, sv3, n, out192, skip_threshold,
+                           kept3);
+#endif
+}
+void attn_step_var(const AttnKV16& kv, const int8_t* q192, const float* coef3,
+                   const float* sv3, int n, float* out192, float skip_threshold,
+                   int* kept3) {
+  attn_impl<AttnKV16, false>(kv, q192, coef3, sv3, n, out192, skip_threshold,
+                             kept3);
+}
+void attn_step_var(const AttnKVF32& kv, const int8_t* q192, const float* coef3,
+                   const float* sv3, int n, float* out192, float skip_threshold,
+                   int* kept3) {
+  attn_impl<AttnKVF32, false>(kv, q192, coef3, sv3, n, out192, skip_threshold,
+                              kept3);
+}
+
+void attn_step_fixed(const AttnKV& kv, const int8_t* q192, const float* coef3,
+                     const float* sv3, float* out192, float skip_threshold,
+                     int* kept3) {
+#if defined(TF_ATTN_SHKV) && TF_KVH == 1
+  attn_impl_shkv<true>(kv, q192, coef3, sv3, ATTN_WIN, out192, skip_threshold,
+                       kept3);
+#else
+  attn_impl<AttnKV, true>(kv, q192, coef3, sv3, ATTN_WIN, out192,
+                          skip_threshold, kept3);
+#endif
+}
+void attn_step_fixed(const AttnKV16& kv, const int8_t* q192,
+                     const float* coef3, const float* sv3, float* out192,
+                     float skip_threshold, int* kept3) {
+  attn_impl<AttnKV16, true>(kv, q192, coef3, sv3, ATTN_WIN, out192,
+                            skip_threshold, kept3);
+}
+void attn_step_fixed(const AttnKVF32& kv, const int8_t* q192,
+                     const float* coef3, const float* sv3, float* out192,
+                     float skip_threshold, int* kept3) {
+  attn_impl<AttnKVF32, true>(kv, q192, coef3, sv3, ATTN_WIN, out192,
+                             skip_threshold, kept3);
+}
+
+}  // namespace opt
+}  // namespace fx2

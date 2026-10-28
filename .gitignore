@@ -1,0 +1,11 @@
+# Ignore all new local files and directories by default.
+# Already-tracked files remain tracked, including future edits.
+# Add a chosen new file explicitly with: git add -f -- path/to/file
+*
+
+/build-work/
+/comp9
+/archive9
+/main.cmix
+/enwik9
+/enwik9_uncompressed
